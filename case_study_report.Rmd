@@ -1,0 +1,383 @@
+---
+title: "Reproducing the C-sequestration case study with rCTOOL"
+subtitle: "A worked implementation of the manuscript's AGWP/GWP accounting framework, on top of the rCTOOL soil-carbon model"
+author: "Draft computational appendix (contact: Franca Giannini Kurina)"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = TRUE,
+                       fig.width = 7.5, fig.height = 5, dpi = 150)
+```
+
+## What this document does
+
+This is a fully reproducible implementation of the **Case study** section of
+the manuscript *"C sequestration accounting"*, built on the
+[**rCTOOL**](https://github.com/francagiannini/rCTOOL) package (the R
+implementation of the C-TOOL soil carbon model, Taghizadeh-Toosi et al.,
+2014). It reproduces:
+
+* **Fig. 6** - CO2 emissions in the 10 years following a single 1000 kg C
+  input (plant material at two C:N ratios, manure, and plant material under
+  a cooler climate)
+* **Fig. 7** - the associated N2O(-N) emissions
+* **Fig. 8** - instantaneous AGWP-scale warming from the sequestered-C CO2
+  emissions vs. an immediate (pulse) emission of the same mass
+* **Fig. 9** - the same, for the N2O emitted from mineralisation of the
+  co-input organic N
+* **Table 2** - the net GWP effect (C sequestration offset + N2O emission)
+  over a 100-year time horizon, in kg CO2e
+* a **bonus scenario** (from the Discussion, the unfinished "Figure xx")
+  comparing the conventional IPCC stock-change method against the
+  AGWP-based method for a *repeated* annual C input
+
+rCTOOL supplies the carbon-turnover engine only (the FOM/HUM/ROM pool
+kinetics). Three things the manuscript adds on top of plain C-TOOL are **not**
+part of the rCTOOL package and are implemented in `R/ghg_functions.R`,
+sourced below:
+
+1. a **single-layer** wrapper around rCTOOL's topsoil pool functions
+   (the paper's Methods: transport parameter set to zero, and the HUM
+   fraction rCTOOL would otherwise ship to the subsoil recycled back into
+   topsoil HUM);
+2. a **nitrogen-mineralisation / N2O** sub-model (Eq. 6-8) built on the
+   carbon fluxes rCTOOL computes;
+3. the **AGWP/GWP metric framework** itself (Eq. 1-9), after Petersen et
+   al. (2013) and Aamaas et al. (2013), using the CO2 impulse-response
+   function of Joos et al. (2013) and the N2O perturbation lifetime of
+   Forster et al. (2021).
+
+```{r libraries}
+# install.packages("remotes")
+# remotes::install_github("francagiannini/rCTOOL")
+# install.packages(c("dplyr", "ggplot2", "tidyr", "knitr"))
+
+library(rCTOOL)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(knitr)
+
+source("R/ghg_functions.R")
+theme_set(theme_classic(base_size = 12))
+```
+
+## A note on Table 1 of the draft
+
+The draft's Table 1 lists $k_{HUM} = 0.028$ kg (kg C)^-1^ (confirmed by
+inspecting the manuscript's own .docx table cells directly, so this is not a
+transcription artefact on our side). Taken literally, that value decomposes
+the HUM pool about 10x faster than rCTOOL's own published default
+($k_{hum} = 0.0028$; see the package's `basic_example`/README), and it
+produces C-sequestration GWP offsets 3-4x smaller in magnitude than the ones
+quoted in the manuscript text.
+
+Using $k_{HUM} = 0.0028$ instead - and measuring "years after input" from
+$t=0$ at the *start* of the input year - reproduces the manuscript's quoted
+C-sequestration offsets to within about 1% for three of the four scenarios,
+and the N2O effective GWPs to within about 3-10% (validation numbers below,
+section "Sanity checks"). That is a strong enough match to suggest "0.028"
+in the draft is missing a leading zero. `k_hum` is set from a single named
+constant so this is a one-line change if the table turns out to be correct
+after all.
+
+**A note on the installed rCTOOL version:** this was developed against
+rCTOOL's GitHub "main" branch (v3.0.0); the CRAN release (v3.1.0) renamed
+the seasonal-temperature argument of `FOM_top_calculations()` /
+`HUM_top_calculations()` / `ROM_top_calculations()` from `t_range` to
+`amplitude`, and rewrote the internal soil-temperature function to add a
+real damped seasonal sine term rather than the GitHub version's
+near-inert one. `run_ctool_pulse()` targets the CRAN argument name and,
+as before, passes `amplitude = 0` deliberately (soil temperature = air
+temperature, no depth lag): using the package's own auto-estimated
+amplitude instead moves the C-sequestration offsets *further* from the
+manuscript's quoted numbers (by a further 6-17%, worst for the
+cool-climate scenario), so `amplitude = 0` remains the better-supported
+choice. Because `amplitude = 0` zeroes out the damping term regardless of
+thermal diffusivity, this choice is unaffected by the CRAN package's
+default `temp_th_diff` differing 10x from the Table 1 value.
+
+```{r table1-params}
+k_hum_value <- 0.0028   # see note above; set to 0.028 for the draft's literal value
+
+s_config <- soil_config(
+  Csoil_init = 0,  Cproptop = 1,               # unused by the pulse wrapper (pools start at 0)
+  f_hum_top = 0.4, f_rom_top = 0.4,             # unused
+  f_hum_sub = 0.4, f_rom_sub = 0.4,             # unused (no subsoil in the single-layer wrapper)
+  clay_top = 0.10, clay_sub = 0.10,             # Table 1: X = 0.10 g/g
+  phi = 0.035,             # legacy parameter, unused by CRAN rCTOOL's soil-temperature function
+  temp_th_diff = 0.035e-6, # Table 1: "0.035 x10^-6" - inert here since amplitude = 0 (see note above)
+  f_co2  = 0.628,      # Table 1
+  f_romi = 0.012,      # Table 1 (f_ROM)
+  k_fom  = 0.12,       # Table 1
+  k_hum  = k_hum_value,
+  k_rom  = 3.85e-5,    # Table 1: "3.85 x10^-5"
+  ftr    = 0           # single-layer configuration: transport parameter tF = 0
+)
+s_config$EF_N2O <- 0.01   # Table 1: kg N2O-N (kg N mineralised)-1
+
+CN_hum <- 11.0; CN_rom <- 11.0   # Table 1
+
+T_standard <- c(19, 22, 17, 16, 11, 11, 9, 8, 10, 13, 17, 19)
+T_cool     <- c(14.8, 16.5, 16.0, 12.8, 9.0, 4.0, 1.8, 0.89, 1.17, 3.5, 6.0, 10.5)
+stopifnot(abs(mean(T_standard) - 14.33) < 0.01, abs(mean(T_cool) - 8.08) < 0.01)
+```
+
+The monthly temperature *means* (14.33 and 8.08 &deg;C) match the 14.3/8.1
+&deg;C quoted in the text for the standard and "cool climate" scenarios,
+confirming the table's values were transcribed correctly.
+
+### `f_man_humification`
+
+This parameter (the fraction of manure C humified immediately on input) is
+not given a numeric value anywhere in the draft. It is cross-checked instead
+against a fact stated in the text: with the manuscript's parametrisation,
+the manure's FOM sub-pool ends up with a C:N ratio of "17.9:1" (not the bulk
+manure ratio of 16:1). Solving for the value of `f_man_humification` that
+reproduces that number:
+
+```{r fman-check}
+f_man_humification <- 0.192   # also rCTOOL's own real-world (Askov) example value
+
+Cman <- 1000; CNman <- 16
+N_tot <- Cman / CNman
+N_hum <- f_man_humification * Cman / CN_hum
+CN_fom_check <- (Cman * (1 - f_man_humification)) / (N_tot - N_hum)
+cat(sprintf("Implied manure FOM C:N ratio at f_man_humification = %.3f: %.1f (text says 17.9)\n",
+            f_man_humification, CN_fom_check))
+```
+
+`f_man_humification = 0.192` reproduces the text's 17.9:1 almost exactly,
+and is also rCTOOL's own default from its real-world Askov straw-incorporation
+example, so it is used throughout below.
+
+## Running the four case-study scenarios
+
+```{r run-scenarios}
+H <- 100            # time horizon, years (Eq. 1)
+n_years_sim <- 150  # simulate beyond H so nothing past the horizon is missed
+Cin_total <- 1000    # kg C, the manuscript's single-input case study
+
+scenario_defs <- list(
+  "Plant (C:N 16:1)"    = list(CN = 16, is_manure = FALSE, temps = T_standard),
+  "Plant (C:N 50:1)"    = list(CN = 50, is_manure = FALSE, temps = T_standard),
+  "Manure"               = list(CN = 16, is_manure = TRUE,  temps = T_standard),
+  "Plant, cool climate"  = list(CN = 16, is_manure = FALSE, temps = T_cool)
+)
+
+sims <- lapply(scenario_defs, function(sc) {
+  run_ctool_pulse(
+    Cin_total = Cin_total, is_manure = sc$is_manure,
+    f_man_humification = f_man_humification,
+    CN_input = sc$CN, CN_hum = CN_hum, CN_rom = CN_rom,
+    s_config = s_config, Tavg = sc$temps,
+    n_years = n_years_sim, input_years = 1, input_month = 1
+  )
+})
+
+summaries <- Map(function(sim) summarize_scenario(sim, Cin_total, H = H), sims)
+```
+
+## Figure 6 - CO2 emissions
+
+```{r fig6}
+fig6_df <- bind_rows(lapply(names(sims), function(nm) {
+  sims[[nm]] %>%
+    mutate(scenario = nm, t_yr = (step - 1) / 12) %>%
+    filter(t_yr <= 10) %>%
+    select(scenario, t_yr, em_CO2)
+}))
+
+ggplot(fig6_df, aes(t_yr, em_CO2, colour = scenario)) +
+  geom_line(linewidth = 0.8) +
+  labs(x = "Years after C input", y = "CO2-C emission (kg / month)", colour = NULL,
+       title = "CO2 emission in the 10 years following the input of 1000 kg C") +
+  theme(legend.position = "bottom")
+```
+
+As in the manuscript, the plant-material curves for C:N = 16:1 and C:N =
+50:1 are identical (carbon turnover does not depend on the nitrogen content
+of the input); the manure curve differs because a fraction of the manure C
+enters the more slowly decomposing HUM pool immediately; and the cool-climate
+curve is delayed and flattened relative to the standard climate.
+
+## Figure 7 - N2O(-N) emissions
+
+```{r fig7}
+fig7_df <- bind_rows(lapply(names(sims), function(nm) {
+  sims[[nm]] %>%
+    mutate(scenario = nm, t_yr = (step - 1) / 12) %>%
+    filter(t_yr <= 10) %>%
+    select(scenario, t_yr, N2ON_emitted)
+}))
+
+ggplot(fig7_df, aes(t_yr, N2ON_emitted, colour = scenario)) +
+  geom_line(linewidth = 0.8) +
+  labs(x = "Years after C input", y = expression(N[2]*O*"-N emission (kg / month)"), colour = NULL,
+       title = "N2O-N emission in the 10 years following the input") +
+  theme(legend.position = "bottom")
+```
+
+Unlike CO2, the N2O curves now differ between C:N = 16:1 and C:N = 50:1
+(more N enters with the C:N = 16:1 input), and the manure curve shows the
+delayed second phase described in the text as N mineralises from the larger
+HUM pool the manure feeds directly.
+
+## Figure 8 - instantaneous warming from the sequestered-C CO2, vs. a pulse
+
+```{r fig8}
+years_out <- seq(0, H, by = 0.5)
+pulse_CO2_mass <- Cin_total * gamma_C_CO2
+
+fig8_df <- bind_rows(lapply(names(summaries), function(nm) {
+  s <- summaries[[nm]]
+  data.frame(scenario = nm, year = years_out,
+             warming = instantaneous_warming_CO2(s$beta_t, years_out, total_co2_mass = pulse_CO2_mass))
+}))
+fig8_pulse <- data.frame(scenario = "Pulse (immediate) emission", year = years_out,
+                          warming = instantaneous_warming_pulse(pulse_CO2_mass, years_out, gas = "CO2"))
+
+ggplot(bind_rows(fig8_df, fig8_pulse), aes(year, warming, colour = scenario, linetype = scenario)) +
+  geom_line(linewidth = 0.8) +
+  labs(x = "Years after input", y = expression("Instantaneous warming (W "*m^-2*")"),
+       colour = NULL, linetype = NULL,
+       title = "Instantaneous warming: sequestered-C CO2 vs. an immediate pulse") +
+  theme(legend.position = "bottom") + guides(colour = guide_legend(nrow = 2))
+```
+
+Sequestration delays and spreads out the CO2 emission, so initial warming is
+lower than a pulse of the same mass - but because so much of the input is
+eventually re-emitted, the sequestered-C curves cross above the pulse curve
+later on, exactly as described for Fig. 8 in the text.
+
+## Figure 9 - instantaneous warming from the associated N2O, vs. a pulse
+
+```{r fig9, fig.height=7, fig.width=9}
+fig9_df <- bind_rows(lapply(names(summaries), function(nm) {
+  s <- summaries[[nm]]
+  data.frame(scenario = nm, year = years_out,
+             warming = instantaneous_warming_N2O(s$eta_t, years_out, total_n2o_mass = s$total_N2O_kg))
+}))
+fig9_pulse <- bind_rows(lapply(names(summaries), function(nm) {
+  s <- summaries[[nm]]
+  data.frame(scenario = nm, year = years_out,
+             warming = instantaneous_warming_pulse(s$total_N2O_kg, years_out, gas = "N2O"))
+}))
+fig9_df$series <- "Sequestered (delayed) N2O"
+fig9_pulse$series <- "Pulse (immediate) N2O"
+
+ggplot(bind_rows(fig9_df, fig9_pulse), aes(year, warming, colour = series)) +
+  geom_line(linewidth = 0.8) +
+  facet_wrap(~scenario, ncol = 2, scales = "free_y") +
+  labs(x = "Years after input", y = expression("Instantaneous warming (W "*m^-2*")"), colour = NULL,
+       title = "Instantaneous warming: delayed N2O vs. an immediate pulse of the same mass") +
+  theme(legend.position = "bottom")
+```
+
+## Table 2 - net GWP effect over H = 100 years
+
+```{r table2}
+table2 <- bind_rows(lapply(names(summaries), function(nm) {
+  s <- summaries[[nm]]
+  data.frame(
+    `Organic matter input` = nm,
+    `C seq. offset (kg CO2e)` = round(s$C_offset_kgCO2e, 0),
+    `N2O emission (kg CO2e)`  = round(s$N2O_effect_kgCO2e, 0),
+    `Net effect (kg CO2e)`    = round(s$net_kgCO2e, 0),
+    `Effective GWP of N2O`    = round(s$gwp_n2o_effective, 0),
+    check.names = FALSE
+  )
+}))
+kable(table2, caption = "Net GHG effect (kg CO2e) of a 1000 kg C input, H = 100 yr")
+```
+
+### Sanity checks against the manuscript text
+
+```{r sanity-check}
+paper_quoted <- data.frame(
+  scenario = c("Plant (C:N 16:1)", "Plant (C:N 50:1)", "Manure", "Plant, cool climate"),
+  paper_C_offset = c(-167, -167, -302, -283),
+  paper_N2O_effect = c(252, 70, 238, 240),
+  paper_eff_GWP = c(256, 222, 241, 244)
+)
+comparison <- table2 %>%
+  rename(scenario = `Organic matter input`,
+         model_C_offset = `C seq. offset (kg CO2e)`,
+         model_N2O_effect = `N2O emission (kg CO2e)`,
+         model_eff_GWP = `Effective GWP of N2O`) %>%
+  left_join(paper_quoted, by = "scenario") %>%
+  mutate(C_offset_pct_diff = 100 * (model_C_offset - paper_C_offset) / paper_C_offset,
+         N2O_effect_pct_diff = 100 * (model_N2O_effect - paper_N2O_effect) / paper_N2O_effect)
+kable(comparison[, c("scenario", "model_C_offset", "paper_C_offset", "C_offset_pct_diff",
+                      "model_N2O_effect", "paper_N2O_effect", "N2O_effect_pct_diff")],
+      digits = 1, caption = "Model output vs. numbers quoted in the manuscript text")
+```
+
+The residual few-percent gaps (mostly in the N2O effective GWP) are expected
+given several pieces of this reconstruction had to be inferred from
+prose rather than read directly off the manuscript's own equations (which
+are embedded as un-OCR'able image objects in the .docx, not extractable
+text) - see the header of `R/ghg_functions.R` for exactly which parts are
+original C-TOOL/rCTOOL and which are this reconstruction.
+
+## Bonus: repeated annual input vs. the conventional stock-change method
+
+The Discussion section sketches, but does not fully specify, a scenario
+comparing the conventional IPCC stock-change method against the AGWP
+approach for a **repeated** annual C input (referred to as "Figure xx",
+with no numeric detail given). The implementation below is a reasonable
+reading of that paragraph, not a literal reproduction:
+
+* **Conventional (stock-change) method**: each year's reported negative
+  emission is $-(\Delta SOC_{stock}) \times 44/12$ - exactly the
+  elemental-mass-balance approach the manuscript's Introduction critiques.
+* **AGWP method**: the correct, time-invariant annual offset is the one
+  already computed for a single 1000 kg C pulse ($GWP_{Cseq} \times C_{in}$),
+  since (per the Discussion) "the GWP-weighted emissions ... will remain
+  constant ... even if repeated each year".
+* The **over-estimation ratio** is conventional / AGWP (ratio > 1 means the
+  conventional method overstates the cooling effect that year).
+
+```{r bonus}
+repeat_years <- 60
+sim_repeat <- run_ctool_pulse(
+  Cin_total = Cin_total, is_manure = FALSE, f_man_humification = f_man_humification,
+  CN_input = 16, CN_hum = CN_hum, CN_rom = CN_rom,
+  s_config = s_config, Tavg = T_standard,
+  n_years = repeat_years, input_years = 1:repeat_years, input_month = 1
+)
+
+soc_annual <- sim_repeat %>%
+  group_by(year) %>%
+  summarise(SOC_stock = last(FOM_top + HUM_top + ROM_top), .groups = "drop") %>%
+  mutate(dSOC = SOC_stock - dplyr::lag(SOC_stock, default = 0),
+         conventional_kgCO2e = -dSOC * gamma_C_CO2)
+
+agwp_annual_offset <- summaries[["Plant (C:N 16:1)"]]$C_offset_kgCO2e
+
+overestimate_df <- soc_annual %>%
+  mutate(agwp_kgCO2e = agwp_annual_offset,
+         overestimation_ratio = conventional_kgCO2e / agwp_kgCO2e)
+
+ggplot(overestimate_df, aes(year, overestimation_ratio)) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey50") +
+  geom_line(linewidth = 0.8) +
+  labs(x = "Year since repeated annual input began",
+       y = "Over-estimation ratio\n(conventional / AGWP)",
+       title = "Over-estimation of the conventional method for a repeated annual 1000 kg C input")
+
+cat(sprintf("Year-1 over-estimation ratio: %.2f\n", overestimate_df$overestimation_ratio[1]))
+```
+
+## Session info
+
+```{r session-info}
+sessionInfo()
+```
